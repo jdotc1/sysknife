@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 python3 - <<'PY'
 import os
+import shutil
 from pathlib import Path
 import re
 import subprocess
@@ -192,6 +193,57 @@ validation_succeeded
         self.assertIn('hygiene: could not derive privileged CI shell tests',
                       result.stdout)
         self.assertNotIn('ci-local: PASS', result.stdout)
+
+    def test_entrypoint_exit_status_matches_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            stub = Path(d)
+            for tool in ('cargo', 'node'):
+                (stub / tool).write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+                (stub / tool).chmod(0o755)
+            for tool in ('bash', 'dirname'):
+                found = shutil.which(tool)
+                self.assertIsNotNone(found, tool + ' is needed to run ci-local.sh')
+                (stub / tool).symlink_to(found)
+
+            def run(*args):
+                return subprocess.run([str(stub / 'bash'), str(ROOT / 'scripts/ci-local.sh'), '--fast', *args],
+                                      env={'HOME': d, 'PATH': str(stub)}, text=True, capture_output=True)
+
+            incomplete = run()
+            accepted = run('--allow-missing-tools')
+        self.assertIn('missing-tool:cargo-nextest', incomplete.stdout)
+        self.assertIn('ci-local: INCOMPLETE', incomplete.stdout)
+        self.assertNotEqual(incomplete.returncode, 0, 'an INCOMPLETE run must not exit 0')
+        self.assertIn('ci-local: PASS', accepted.stdout, accepted.stdout + accepted.stderr)
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        self.assertNotIn('missing-tool:', accepted.stdout)
+
+    def test_every_missing_ci_tool_is_a_required_skip(self):
+        code = functions('record', 'mark_required_skip', 'record_missing_ci_tool',
+                         'run_step', 'run_hygiene_group', 'run_security_group') + '''
+RESULTS=(); hard_failures=0; required_skips=(); allow_missing_tools=false
+have() { return 1; }
+python3() { :; }
+npm() { :; }
+bash() { :; }
+run_shell_tests() { :; }
+run_hygiene_group
+run_security_group
+printf 'skip=%s\\n' "${required_skips[@]}"
+'''
+        result = bash(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        skips = {line[len('skip='):] for line in result.stdout.splitlines() if line.startswith('skip=')}
+        self.assertEqual(skips, {'missing-tool:' + tool for tool in (
+            'markdownlint-cli2', 'markdown-link-check', 'yamllint', 'shellcheck', 'cargo-audit')})
+
+    def test_privileged_discovery_lists_only_workflow_tests(self):
+        result = bash(functions('privileged_ci_shell_tests') + '\nprivileged_ci_shell_tests\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listed = result.stdout.splitlines()
+        self.assertTrue(listed, 'privileged discovery must name at least one test')
+        for line in listed:
+            self.assertRegex(line, r'^tests/(release|e2e)/[\w.-]+\.test\.sh$')
 
     def test_podman_precedes_docker(self):
         code = functions('record', 'run_postgres_contract_group') + '''
